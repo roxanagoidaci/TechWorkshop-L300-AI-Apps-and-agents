@@ -30,5 +30,5 @@ EXPOSE 8000
 # Set environment variables (override in production)
 ENV PORT=8000
 
-# Start the FastAPI app
+# Start the FastAPI app (MCP inventory server is mounted inside chat_app)
 CMD ["uvicorn", "chat_app:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -17,6 +17,7 @@ from tools.discountLogic import calculate_discount
 from tools.inventoryCheck import inventory_check
 from tools.aiSearchTools import product_recommendations
 
+
 from opentelemetry import trace
 from azure.monitor.opentelemetry import configure_azure_monitor
 from azure.ai.agents.telemetry import trace_function

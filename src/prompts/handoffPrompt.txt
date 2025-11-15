@@ -1,4 +1,4 @@
-Select the appropriate agent as per query.
+Select the appropriate agent as per query. Only the following agents are accepted.
 interior_designer =  When asked for any kind of product, product recommendation, style trend, additional accessories, video summarize, verify the given product, check what the video contains and anything related to video.
 interior_designer_create_image = When asked to create image or repaint room or make room color to some other color. Choose this agent when query is like editing the image.
 customer_loyalty = When asked about customer loyalty details or calculating discounts.
