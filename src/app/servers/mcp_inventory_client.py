@@ -63,21 +63,26 @@ class MCPShopperToolsClient:
                 return result
     
     async def list_tools(self):
+        
         """
         List all available tools from the MCP server
         
         Returns:
             List of available tools
         """
-        async with sse_client(self.server_url) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                logger.info("Listing available tools...")
-                
-                tools_result = await session.list_tools()
-                logger.info(f"Found {len(tools_result.tools)} tools")
-                
-                return tools_result.tools
+        try:
+            async with sse_client(self.server_url) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    logger.info("Listing available tools...")
+                    
+                    tools_result = await session.list_tools()
+                    logger.info(f"Found {len(tools_result.tools)} tools")
+                    
+                    return tools_result.tools
+        except Exception as e:
+            logger.error(f"Error listing tools: {e}")
+            raise e
     
     async def get_mcp_tools_llm(self) -> List[Dict[str, Any]]:
         """Get available tools from the MCP server in OpenAI format.
@@ -192,7 +197,7 @@ async def main():
 # Singleton instance
 _mcp_client: Optional[MCPShopperToolsClient] = None
 
-async def get_mcp_client(server_url: str = "http://localhost:8052/see") -> MCPShopperToolsClient:
+async def get_mcp_client(server_url: str = "http://localhost:8050/see") -> MCPShopperToolsClient:
     """Get or create the singleton MCP client."""
     global _mcp_client
     if _mcp_client is None:

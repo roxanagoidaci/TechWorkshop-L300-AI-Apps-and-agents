@@ -135,38 +135,46 @@ IMPORTANT: Your entire response must be a valid JSON array as described above. D
         assistant_message,
     ]
 
-    # Handle tool calls if present
-    if assistant_message.tool_calls:
-        # Process each tool call
-        for tool_call in assistant_message.tool_calls:
-            # Execute tool call
-            result = await mcp_client.session.call_tool(
-                tool_call.function.name,
-                arguments=json.loads(tool_call.function.arguments),
-            )
+    try:
+        # Handle tool calls if present
+        if assistant_message.tool_calls:
+            # Process each tool call
+            for tool_call in assistant_message.tool_calls:
+                # Execute tool call
+                result = await mcp_client.call_tool(
+                    tool_call.function.name,
+                    arguments=json.loads(tool_call.function.arguments),
+                )
 
-            # Add tool response to conversation
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": result.content[0].text,
-                }
-            )
+                # Ensure result is a string for the tool response
+                result_str = json.dumps(result) if isinstance(result, (dict, list)) else str(result)
 
-            # Get final response from OpenAI with tool results
-            final_response = await client.chat.completions.create(
-                model=deployment,
-                messages=messages,
-                tools=tools,
-                tool_choice="none",  # Don't allow more tool calls
-            )
-            end_sum = time.time()
-            print(f"MCP Tools Demonstrative agent :generate_response_using_tools: Execution Time: {end_sum - start_time} seconds")
+                # Add tool response to conversation
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result_str,
+                    }
+                )
 
-            return final_response.choices[0].message.content
+                # Get final response from OpenAI with tool results
+                final_response = client.chat.completions.create(
+                    model=deployment,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="none",  # Don't allow more tool calls
+                )
+                end_sum = time.time()
+                print(f"MCP Tools Demonstrative agent :generate_response_using_tools: Execution Time: {end_sum - start_time} seconds")
+
+                return final_response.choices[0].message.content
 
         # No tool calls, just return the direct response
         return assistant_message.content
+    except Exception as e:
+        print(f"Error during tool execution: {str(e)}")
+        raise e
+    
     # Return response content
     return completion.choices[0].message.content

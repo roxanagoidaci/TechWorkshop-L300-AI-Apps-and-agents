@@ -153,6 +153,5 @@ def agentPrompt(agent_name: str) -> str:
     else:
         return f"Unknown agent name: {agent_name}. Valid options are: cora, customer_loyalty, discount_logic, interior_designer, inventory, shopper"
 
-
 if __name__ == "__main__":
     mcp.run(transport="sse")

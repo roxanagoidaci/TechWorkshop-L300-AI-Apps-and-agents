@@ -20,18 +20,15 @@ else:
 from pathlib import Path
 from agent_processor import create_function_tool_for_agent
 
+CL_PROMPT_TARGET = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'prompts', 'CustomerLoyaltyAgentPrompt.txt')
+with open(CL_PROMPT_TARGET, 'r', encoding='utf-8') as file:
+    CL_PROMPT = file.read()
 
-IA_PROMPT_TARGET = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'prompts', 'InventoryAgentPrompt.txt')
-with open(IA_PROMPT_TARGET, 'r', encoding='utf-8') as file:
-    IA_PROMPT = file.read()
-
-project_endpoint = os.environ["AZURE_AI_AGENT_ENDPOINT"]
-
+project_endpoint= os.getenv("AZURE_AI_AGENT_ENDPOINT")
 project_client = AIProjectClient(
     endpoint=project_endpoint,
     credential=DefaultAzureCredential(),
 )
-
 
 # Define the set of user-defined callable functions to use as tools (from MCP client)
 functions = create_function_tool_for_agent("customer_loyalty")
@@ -40,12 +37,12 @@ toolset.add(functions)
 project_client.agents.enable_auto_function_calls(tools=functions)
 
 
+
 with project_client:
-    # Create an agent with the Bing Grounding tool
     agent = project_client.agents.create_agent(
         model=os.getenv("AZURE_AI_AGENT_MODEL_DEPLOYMENT_NAME"),  # Model deployment name
-        name="Zava Inventory Agent",  # Name of the agent
-        instructions=IA_PROMPT,  # Instructions for the agent
-        toolset=toolset
+        name="Zava Customer Loyalty Agent",  # Name of the agent
+        instructions=CL_PROMPT,  # Instructions for the agent
+        toolset=toolset,
     )
     print(f"Created agent, ID: {agent.id}")

@@ -21,12 +21,13 @@ def load_env_vars() -> Dict[str, Optional[str]]:
         'AZURE_OPENAI_ENDPOINT': os.getenv("AZURE_OPENAI_ENDPOINT"),
         'AZURE_OPENAI_KEY': os.getenv("AZURE_OPENAI_KEY"),
         'AZURE_OPENAI_API_VERSION': os.getenv("AZURE_OPENAI_API_VERSION"),
+        'MCP_SERVER_URL': os.getenv("MCP_SERVER_URL"),
     }
 
 def validate_env_vars(env_vars: Dict[str, Optional[str]]) -> Dict[str, str]:
     """Validate that required environment variables are set and return validated dict."""
     required_vars = [
-        'phi_4_endpoint', 'phi_4_api_key', 'phi_4_api_version', 'phi_4_deployment'
+        'phi_4_endpoint', 'phi_4_api_key', 'phi_4_api_version', 'phi_4_deployment', 'MCP_SERVER_URL'
     ]
     missing_vars = [var for var in required_vars if not env_vars.get(var)]
     if missing_vars:
