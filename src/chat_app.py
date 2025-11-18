@@ -11,6 +11,7 @@ from azure.ai.inference import ChatCompletionsClient
 from azure.core.credentials import AzureKeyCredential
 from collections import deque
 from typing import Deque, Tuple, Optional, Dict
+import uuid
 
 import orjson  # Faster JSON library
 from openai import AzureOpenAI
@@ -53,7 +54,7 @@ validated_env_vars = validate_env_vars(env_vars)
 
 #from app.agents.singleAgentExample import generate_response
 from services.agent_service import get_or_create_agent_processor
-from services.handoff_service import call_handoff, select_agent
+from services.handoff_service import HandoffService
 from services.fallback_service import call_fallback, cora_fallback
 from app.agents.mcpToolAgentExample import generate_response_using_tools
 from app.servers.mcp_inventory_server import mcp as inventory_mcp
@@ -185,13 +186,19 @@ def format_user_message_with_products(image_url: str, image_data: str, video_sum
                                    formatted_history: str, products) -> str:
     """Optimized string formatting for user messages with products."""
     parts = [
-        f'"image_url": "{image_url or ""}",',
-        f'"image_description": "{image_data or ""}",',
-        f'"video_description": "{video_summary or ""}",',
-        f'"conversation_history": "{formatted_history}",',
+        f'"image_url": "{image_url or ""}"',
+        f'"image_description": "{image_data or ""}"',
+        f'"video_description": "{video_summary or ""}"',
+        f'"conversation_history": "{formatted_history}"',
         f'"products_available": {fast_json_dumps(products)}'
     ]
     return "{" + ", ".join(parts) + "}"
+
+async def get_video_summary(video_url: str) -> str:
+    """Get video summary (placeholder for actual video analysis)."""
+    # TODO: Implement actual video analysis
+    # For now, return a placeholder indicating video was received
+    return f"Video received from URL: {video_url}. Video content analysis pending."
 
 # Safe operation wrapper for better error handling
 async def safe_operation(operation, fallback_value=None, operation_name="Unknown"):
@@ -393,6 +400,14 @@ llm_client = AzureOpenAI(
     api_version=validated_env_vars['AZURE_OPENAI_API_VERSION'],
 )
 
+# Initialize HandoffService with structured intent classification
+handoff_service = HandoffService(
+    azure_openai_client=llm_client,
+    deployment_name=validated_env_vars['gpt_deployment'],
+    default_domain="cora",
+    lazy_classification=True
+)
+
 @app.get("/")
 async def get():
     chat_html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'chat.html')
@@ -418,6 +433,7 @@ async def health_check():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     session_start_time = time.time()
+    session_id = str(uuid.uuid4())
     logger.info("WebSocket Session Started")
     
     await websocket.accept()
@@ -586,250 +602,148 @@ async def websocket_endpoint(websocket: WebSocket):
             #     logger.error("Error during mcp-tools-agent response generation", exc_info=True)
             #     await websocket.send_text(fast_json_dumps({"answer": "Error during mcp-tools-agent response generation", "error": str(e), "cart": persistent_cart}))
 
-            # # Step 3: Multi-agent with handoff example
+            # # Step 3: Multi-agent with handoff using HandoffService
             try:
                 handoff_start_time = time.time()
                 formatted_history = format_chat_history(redact_bad_prompts_in_history(chat_history, bad_prompts))
                 logger.debug("Handoff agent execution initiated - commencing agent selection protocol")
-                with tracer.start_as_current_span("Handoff Agent Call"):
-                    handoff_reply = call_handoff(
-                        handoff_client,
-                        HANDOFF_PROMPT,
-                        formatted_history,
-                        validated_env_vars['phi_4_deployment']
+                with tracer.start_as_current_span("Handoff Intent Classification"):
+                    # Use new HandoffService for intent classification
+                    intent_result = handoff_service.classify_intent(
+                        user_message=user_message,
+                        session_id=session_id,
+                        chat_history=formatted_history
                     )
-                logger.debug("Handoff agent response received - agent selection criteria processed")
-                logger.debug(f"Handoff reply: {handoff_reply}")
-                log_timing("Handoff Processing", handoff_start_time, f"Reply length: {len(handoff_reply)} chars")
-                # Handle content filter error from handoff
-                if isinstance(handoff_reply, str) and handoff_reply.startswith("__CONTENT_FILTER_ERROR__"):
-                    error_message = handoff_reply.replace("__CONTENT_FILTER_ERROR__", "").strip()
-                    # Add the last user message to bad_prompts
-                    if chat_history and chat_history[-1][0] == "user":
-                        bad_prompts.add(chat_history[-1][1])
+                
+                agent_name = intent_result["agent_id"]
+                agent_selected = validated_env_vars.get(agent_name)
+                
+                logger.debug(f"Intent classification: domain={intent_result['domain']}, "
+                           f"confidence={intent_result['confidence']:.2f}, "
+                           f"reasoning={intent_result['reasoning']}")
+                log_timing("Handoff Processing", handoff_start_time, 
+                          f"Selected: {agent_name} (confidence: {intent_result['confidence']:.2f})")
+                
+                # Check if agent selection failed
+                if not agent_selected or not agent_name:
                     await websocket.send_text(fast_json_dumps({
-                        "answer": "Your message triggered a content filter and cannot be processed. Please modify your prompt and try again.",
+                        "answer": "Sorry, I could not determine the right agent.",
                         "agent": None,
-                        "error": error_message,
                         "cart": persistent_cart
                     }))
                     continue
+                    
             except Exception as e:
-                logger.error("Error during handoff call", exc_info=True)
-                await websocket.send_text(fast_json_dumps({"answer": "Error during handoff call", "error": str(e), "cart": persistent_cart}))
+                logger.error("Error during handoff classification", exc_info=True)
+                await websocket.send_text(fast_json_dumps({
+                    "answer": "Error during handoff classification",
+                    "error": str(e),
+                    "cart": persistent_cart
+                }))
                 continue
             
-            # Check for 'cart' in the user query before agent selection
-            try:
-                if 'cart' in user_message.lower():
-                    cart_start_time = time.time()
-                    # Use the full raw_io_history as JSON - optimize with orjson
-                    cart_prompt = CART_UPDATE_PROMPT + "\nRAW_IO_HISTORY:\n" + fast_json_dumps(list(raw_io_history), option=orjson.OPT_INDENT_2)
-                    logger.debug("Cora agent cart update operation initiated - commencing cart state modification")
-                    cora_prompt = CORA_FALLBACK_PROMPT + "\n" + formatted_history
-
-                    async def run_cart_update():
-                        loop = asyncio.get_event_loop()
-                        result = await loop.run_in_executor(thread_pool, cart_update, llm_client, cart_prompt)
-                        return result
-                    async def run_cora_fallback():
-                        loop = asyncio.get_event_loop()
-                        result = await loop.run_in_executor(thread_pool, cora_fallback, llm_client, cora_prompt)
-                        return result
-
-                    try:
-                        cart_reply_raw, cora_reply_raw = await asyncio.gather(run_cart_update(), run_cora_fallback())
-                    except Exception as e:
-                        logger.error("Error processing cart/cora", exc_info=True)
-                        await websocket.send_text(fast_json_dumps({"answer": "Error processing cart/cora", "error": str(e), "cart": persistent_cart}))
-                        continue
-
-                    cart_json = parse_agent_response(cart_reply_raw)
-                    cora_json = parse_agent_response(cora_reply_raw)
-
-                    logger.debug(f"Cart reply: {cart_reply_raw}")
-                    
-                    logger.debug("Cart update operation completed - cart state successfully modified")
-                    logger.debug("Cora agent thread execution terminated - response processing complete")
-
-                    # Use new merge_cart_and_cora utility for robust merging
-                    merged = merge_cart_and_cora(cart_reply_raw, cora_reply_raw)
-
-                    logger.debug(f"Merged result: {merged}")
-                    # Update persistent_cart with the latest cart state
-                    if isinstance(merged.get("cart"), list):
-                        persistent_cart = merged["cart"]
-                    response_json = fast_json_dumps({**merged, "cart": persistent_cart})
-                    raw_io_history.append({"output": response_json, "cart": persistent_cart})
-                    
-                    # Add the merged response to chat history with products if available
-                    bot_answer = merged.get("answer", "")
-                    product_names = extract_product_names_from_response(merged)
-                    chat_history.append(("bot", bot_answer + product_names))
-                    
-                    await websocket.send_text(response_json)
-                    log_timing("Cart/Cora Processing", cart_start_time, f"Cart items: {len(persistent_cart)}")
-                    # After cart/cora response, send loyalty response if available (only once per session)
-                    if session_loyalty_response and not loyalty_response_sent:
-                        loyalty_response_with_cart = {**session_loyalty_response, "cart": persistent_cart}
-                        await websocket.send_text(fast_json_dumps(loyalty_response_with_cart))
-                        loyalty_response_sent = True
-                    continue
-            except Exception as e:
-                logger.error("Error in cart/cora handling", exc_info=True)
-                await websocket.send_text(fast_json_dumps({"answer": "Error in cart/cora handling", "error": str(e), "cart": persistent_cart}))
-                continue
-
-            # Fallback message if no agent is selected
-            try:
-                agent_selection_start_time = time.time()
-                agent_selected, agent_name = select_agent(handoff_reply, validated_env_vars)
-                if not agent_selected or not agent_name:
-                    await websocket.send_text(fast_json_dumps({"answer": "Sorry, I could not determine the right agent.", "agent": None, "cart": persistent_cart}))
-                    continue
-                logger.debug(f"Agent selection protocol completed - {agent_name} agent designated for task execution")
-                log_timing("Agent Selection", agent_selection_start_time, f"Selected: {agent_name}")
-            except Exception as e:
-                logger.error("Error during agent selection", exc_info=True)
-                await websocket.send_text(fast_json_dumps({"answer": "Error during agent selection", "error": str(e), "cart": persistent_cart}))
-                continue
-            
+            # Intent classification handles cart routing now - no special case needed
+            # The HandoffService will classify cart-related queries and route to cart_manager agent
+            # Unified agent execution with enriched context
             try:
                 agent_execution_start_time = time.time()
-                #check agent
-                if agent_name == "interior_designer":
-                    logger.debug("Interior Designer agent execution initiated - commencing design consultation protocol")
-                    with tracer.start_as_current_span("Zava Interior Designer Agent Call"):
-                        image_data = None
-                        video_summary = None
-                        products = None
-
-                        if not image_url and not video_url:
-                            product_start_time = time.time()
-                            products = product_recommendations(user_message)
-                            
-                            log_timing("Product Recommendations", product_start_time, f"Products found: {len(products) if products else 0}")
-                            logger.debug("Product recommendation engine execution completed - catalog query processed")
-
-                            user_message = f"{user_message}\n\nProducts: {fast_json_dumps(products)}"
-                            user_message = format_user_message_with_products(
-                                image_url or "", image_data or "", video_summary or "", 
-                                formatted_history, products
-                            )
-
-                            fallback_prompt = FALLBACK_PROMPT + f"\n\n {user_message}"
-                            
-                            fallback_start_time = time.time()
-                            fallback_reply = call_fallback(
-                                llm_client,
-                                fallback_prompt,
-                                validated_env_vars['gpt_deployment']
-                            )
-                            log_timing("Interior Designer Fallback", fallback_start_time, "No image/video")
-                            
-                            msg = fallback_reply
-                            bot_reply = extract_bot_reply(msg)
-
-                        else:
-                            multimodal_data = ''
-                            
-                            if image_url:
-                                image_start_time = time.time()
-                                log_cache_status(image_cache, image_url)
-                                image_data = await get_cached_image_description(image_url, image_cache)
-                                log_timing("Image Analysis", image_start_time, f"URL: {image_url[:50]}...")
-                                multimodal_data =  image_data
-                                analysis_msg = get_rotating_message(IMAGE_ANALYSIS_MESSAGES)
-                                await websocket.send_text(fast_json_dumps({"answer": analysis_msg, "agent": "interior_designer", "cart": persistent_cart}))
-                                logger.debug("Image analysis pipeline completed - visual content processing terminated")
-                                
-                                product_start_time = time.time()
-                                products = product_recommendations(user_message + multimodal_data + "paint accessories, paint sprayers, drop cloths, painters tape")
-                                log_timing("Product Recommendations", product_start_time, f"Products found: {len(products) if products else 0}")
-                                logger.debug("Product recommendation engine execution completed - catalog query processed")
-                                user_message = f"{user_message}\n\nProducts: {fast_json_dumps(products)}"
-                                user_message = format_user_message_with_products(
-                                    image_url or "", image_data or "", video_summary or "", 
-                                    formatted_history, products
-                                )
-                                fallback_prompt = FALLBACK_PROMPT + f"\n\n {user_message}"
-                                
-                                fallback_start_time = time.time()
-                                fallback_reply = call_fallback(
-                                    llm_client,
-                                    fallback_prompt,
-                                    validated_env_vars['gpt_deployment']
-                                )
-                                log_timing("Interior Designer Fallback", fallback_start_time, "With image")
-                                msg = fallback_reply
-                                bot_reply = extract_bot_reply(msg)
-                            
-                            
-                            elif video_url:
-                                video_start_time = time.time()
-                                logger.debug("Video analysis initiated - commencing video content processing")
-                                video_summary = get_video_summary(video_url)
-                                thank_you_msg = get_rotating_message(VIDEO_UPLOAD_MESSAGES)
-                                await websocket.send_text(fast_json_dumps({"answer": thank_you_msg, "agent": "interior_designer", "cart": persistent_cart}))
-                                log_timing("Video Analysis", video_start_time, f"URL: {video_url[:50]}...")
-                                multimodal_data = video_summary
-                                analysis_msg = get_rotating_message(VIDEO_ANALYSIS_MESSAGES)
-                                await websocket.send_text(fast_json_dumps({"answer": analysis_msg, "agent": "interior_designer", "cart": persistent_cart}))
-                                logger.debug("Video analysis pipeline completed - temporal content processing terminated")
-                                # await websocket.send_text(fast_json_dumps({"answer": multimodal_data, "agent": "interior_designer", "cart": persistent_cart}))
-                                product_start_time = time.time()
-                                products = product_recommendations(user_message + multimodal_data + "paint accessories, paint sprayers, drop cloths, painters tape")
-                                log_timing("Product Recommendations", product_start_time, f"Products found: {len(products) if products else 0}")
-                                logger.debug("Product recommendation engine execution completed - catalog query processed")
-                                user_message = f"{user_message}\n\nProducts: {fast_json_dumps(products)}"
-                                user_message = format_user_message_with_products(
-                                    image_url or "", image_data or "", video_summary or "", 
-                                    formatted_history, products
-                                )
-                                fallback_prompt = "Received video from user:" + FALLBACK_PROMPT + f"\n\n {user_message}"
-                                
-                                fallback_start_time = time.time()
-                                fallback_reply = call_fallback(
-                                    llm_client,
-                                    fallback_prompt,
-                                    validated_env_vars['gpt_deployment']
-                                )
-                                log_timing("Interior Designer Fallback", fallback_start_time, "With video")
-                                msg = fallback_reply
-                                bot_reply = extract_bot_reply(msg)
+                logger.debug(f"{agent_name} agent execution initiated")
                 
-                elif agent_name == "interior_designer_create_image":
-                    logger.debug("Interior Designer agent execution initiated - commencing design consultation protocol")
-                    with tracer.start_as_current_span("Zava Interior Designer Agent Call"):
-                        image_data = None
-                        video_summary = None
-                        products = None
-                        thank_you_msg = get_rotating_message(IMAGE_CREATE_MESSAGES)
-                        await websocket.send_text(fast_json_dumps({"answer": thank_you_msg, "agent": "interior_designer", "cart": persistent_cart}))
-                        multimodal_data = ''
-                        
+                # Prepare enriched context for agent
+                enriched_message = user_message
+                image_data = None
+                video_summary = None
+                products = None
+                
+                # Process multimodal inputs if present
+                if image_url or video_url:
+                    if image_url:
                         image_start_time = time.time()
-                        log_cache_status(image_cache, persistent_image_url)
-                        image_data = await get_cached_image_description(persistent_image_url, image_cache)
-                        log_timing("Image Analysis (Create)", image_start_time, f"URL: {persistent_image_url[:50]}...")
-                        multimodal_data =  image_data
-                        logger.debug("Image analysis pipeline completed - visual content processing terminated")
-                        user_message = str(user_message) + str(multimodal_data)
+                        log_cache_status(image_cache, image_url)
+                        image_data = await get_cached_image_description(image_url, image_cache)
+                        log_timing("Image Analysis", image_start_time, f"URL: {image_url[:50]}...")
                         
-                        product_start_time = time.time()
-                        products = product_recommendations(user_message + "paint accessories, sprayers, drop cloths, painters tape")
-                        log_timing("Product Recommendations", product_start_time, f"Products found: {len(products) if products else 0}")
-                        logger.debug("Product recommendation engine execution completed - catalog query processed")
-                        INSTRUCTIONS = "ADDITIONAL INFO: Along with the created image, say that it will be good to have paint accessories, sprayers, drop cloths, painters tape"
-                        user_message = f"{user_message + INSTRUCTIONS}\n\nProducts: {fast_json_dumps(products)}"
-                        user_message = format_user_message_with_products(
-                            persistent_image_url or "", image_data or "", video_summary or "", 
-                            formatted_history, products
-                        )
+                        # Send analysis message to user
+                        analysis_msg = get_rotating_message(IMAGE_ANALYSIS_MESSAGES)
+                        await websocket.send_text(fast_json_dumps({
+                            "answer": analysis_msg,
+                            "agent": agent_name,
+                            "cart": persistent_cart
+                        }))
+                        logger.debug("Image analysis completed")
+                    
+                    if video_url:
+                        video_start_time = time.time()
+                        logger.debug("Video analysis initiated")
+                        video_summary = await get_video_summary(video_url)
                         
-                        image = create_image(text=user_message, image_url=persistent_image_url)
-
-                        # Create the response in the specified format and send directly to frontend
+                        # Send upload confirmation
+                        thank_you_msg = get_rotating_message(VIDEO_UPLOAD_MESSAGES)
+                        await websocket.send_text(fast_json_dumps({
+                            "answer": thank_you_msg,
+                            "agent": agent_name,
+                            "cart": persistent_cart
+                        }))
+                        
+                        log_timing("Video Analysis", video_start_time, f"URL: {video_url[:50]}...")
+                        
+                        # Send analysis message
+                        analysis_msg = get_rotating_message(VIDEO_ANALYSIS_MESSAGES)
+                        await websocket.send_text(fast_json_dumps({
+                            "answer": analysis_msg,
+                            "agent": agent_name,
+                            "cart": persistent_cart
+                        }))
+                        logger.debug("Video analysis completed")
+                
+                # Get product recommendations for relevant agents
+                if agent_name in ["interior_designer", "interior_designer_create_image", "cora"]:
+                    product_start_time = time.time()
+                    search_query = user_message
+                    if image_data:
+                        search_query += f" {image_data} paint accessories, paint sprayers, drop cloths, painters tape"
+                    if video_summary:
+                        search_query += f" {video_summary} paint accessories, paint sprayers, drop cloths, painters tape"
+                    
+                    products = product_recommendations(search_query)
+                    log_timing("Product Recommendations", product_start_time, f"Found: {len(products) if products else 0}")
+                    logger.debug("Product recommendations completed")
+                
+                # Build enriched message with all context
+                if image_data or video_summary or products:
+                    context_parts = []
+                    if image_data:
+                        context_parts.append(f"Image description: {image_data}")
+                    if video_summary:
+                        context_parts.append(f"Video description: {video_summary}")
+                    if products:
+                        context_parts.append(f"Available products: {fast_json_dumps(products)}")
+                    
+                    enriched_message = f"{user_message}\n\n" + "\n".join(context_parts)
+                
+                # Execute agent based on type - unified agent processor pattern
+                bot_reply = ""
+                
+                with tracer.start_as_current_span(f"{agent_name.title()} Agent Call"):
+                    # Handle special case: image creation flow
+                    if agent_name == "interior_designer_create_image":
+                        # Acknowledge image creation request
+                        thank_you_msg = get_rotating_message(IMAGE_CREATE_MESSAGES)
+                        await websocket.send_text(fast_json_dumps({
+                            "answer": thank_you_msg,
+                            "agent": "interior_designer",
+                            "cart": persistent_cart
+                        }))
+                        
+                        # Use persistent image URL for context
+                        if persistent_image_url:
+                            image_data = await get_cached_image_description(persistent_image_url, image_cache)
+                            enriched_message = f"{user_message} {image_data}"
+                        
+                        # Create image
+                        image = create_image(text=enriched_message, image_url=persistent_image_url)
+                        
+                        # Build response with image
                         response_data = {
                             "answer": "Here is the requested image",
                             "products": "",
@@ -840,54 +754,53 @@ async def websocket_endpoint(websocket: WebSocket):
                             "cart": persistent_cart
                         }
                         
-                        # Send the response directly to frontend
+                        # Send response
                         response_json = fast_json_dumps(response_data)
                         raw_io_history.append({"output": response_json, "cart": persistent_cart})
                         
-                        # Add to chat history
                         bot_answer = response_data.get("answer", "")
                         product_names = extract_product_names_from_response(response_data)
                         chat_history.append(("bot", bot_answer + product_names))
                         
                         await websocket.send_text(response_json)
                         log_timing("Agent Execution", agent_execution_start_time, f"Agent: {agent_name}")
-                        continue  # Skip the common response handling below
-                
-                elif agent_name == "cora":
-                    logger.debug("Cora agent execution initiated - commencing conversational AI protocol")
-                    with tracer.start_as_current_span("Agent Cora Call"):
-                        prompt_for_cora = CORA_FALLBACK_PROMPT + formatted_history 
-                        
-                        cora_start_time = time.time()
-                        cora_fallback_reply = cora_fallback(
-                            llm_client,
-                            prompt_for_cora,
-                            validated_env_vars['phi_4_deployment']
-                        )
-                        log_timing("Cora Agent Call", cora_start_time, "Fallback model")
-                        msg = cora_fallback_reply
+                        continue  # Skip common response handling
+                    
+                    # Prepare context based on agent type
+                    agent_context = enriched_message
+                    
+                    # Cart manager needs full raw_io_history for state management
+                    if agent_name == "cart_manager":
+                        agent_context = f"{enriched_message}\n\nRAW_IO_HISTORY:\n{fast_json_dumps(list(raw_io_history), option=orjson.OPT_INDENT_2)}"
+                    
+                    # Cora needs conversation history
+                    elif agent_name == "cora":
+                        agent_context = f"{formatted_history}\n\nUser: {enriched_message}"
+                    
+                    # All agents use unified agent processor pattern
+                    processor = get_or_create_agent_processor(
+                        agent_id=agent_selected,
+                        agent_type=agent_name,
+                        thread_id=thread.id,
+                        project_client=project_client
+                    )
+                    
+                    async for msg in processor.run_conversation_with_text_stream(input_message=agent_context):
                         bot_reply = extract_bot_reply(msg)
-                    logger.debug("Cora agent execution terminated - conversational AI protocol completed")
                 
-                else:
-                    logger.debug(f"{agent_name} agent execution initiated - commencing specialized task protocol")
-                    with tracer.start_as_current_span("Customer Loyalty Agent Call - Additional"):
-                        processor = get_or_create_agent_processor(
-                            agent_id=agent_selected,
-                            agent_type=agent_name,
-                            thread_id=thread.id,
-                            project_client=project_client
-                        )
-                    logger.debug(f"{agent_name} agent execution terminated - specialized task protocol completed")
-                    bot_reply = ""
-                    async for msg in processor.run_conversation_with_text_stream(input_message=user_message):
-                        bot_reply = extract_bot_reply(msg)
+                logger.debug(f"{agent_name} agent execution completed")
                 
                 log_timing("Agent Execution", agent_execution_start_time, f"Agent: {agent_name}")
                 
                 # Parse the response first to get products
                 parsed_response = parse_agent_response(bot_reply)
                 parsed_response["agent"] = agent_name  # Override agent field
+                
+                # Update persistent_cart if cart_manager returned a cart
+                if agent_name == "cart_manager" and "cart" in parsed_response:
+                    if isinstance(parsed_response.get("cart"), list):
+                        persistent_cart = parsed_response["cart"]
+                        logger.debug(f"Cart updated by cart_manager: {len(persistent_cart)} items")
                 
                 # Add the bot reply to chat history with products if available
                 bot_answer = parsed_response.get("answer", bot_reply or "")
@@ -911,6 +824,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 response_json = fast_json_dumps({**parsed_response, "cart": persistent_cart})
                 raw_io_history.append({"output": response_json, "cart": persistent_cart})
                 await websocket.send_text(response_json)
+                
+                # After cart_manager response, send loyalty response if available (only once per session)
+                if agent_name == "cart_manager" and session_loyalty_response and not loyalty_response_sent:
+                    loyalty_response_with_cart = {**session_loyalty_response, "cart": persistent_cart}
+                    await websocket.send_text(fast_json_dumps(loyalty_response_with_cart))
+                    loyalty_response_sent = True
+                    
             except Exception as e:
                 logger.error("Error in agent execution", exc_info=True)
                 try:
@@ -949,6 +869,7 @@ if __name__ == "__main__":
     connection_message = f"Connection Established - Zava Chat App - {formatted_date}"
     with tracer.start_as_current_span(connection_message):
         import uvicorn
+
         port = int(os.environ.get("PORT", 8000))
         uvicorn.run("chat_app:app", host="0.0.0.0", port=port)
 

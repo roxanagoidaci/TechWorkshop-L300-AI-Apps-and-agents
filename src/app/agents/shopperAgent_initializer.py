@@ -1,13 +1,12 @@
 import os
 import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from azure.ai.projects import AIProjectClient
 from azure.identity import DefaultAzureCredential
-from azure.ai.agents.models import CodeInterpreterTool,FunctionTool, ToolSet
+from azure.ai.agents.models import CodeInterpreterTool, FunctionTool, ToolSet
 from typing import Callable, Set, Any
 import json
 from dotenv import load_dotenv
-
 from pathlib import Path
 
 env_path = Path(__file__).parent.parent.parent / '.env'
@@ -17,6 +16,7 @@ else:
     # Try loading from current directory as fallback
     load_dotenv(override=True)
 
+from agent_processor import create_function_tool_for_agent
 
 CORA_PROMPT_TARGET = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'prompts', 'ShopperAgentPrompt.txt')
 with open(CORA_PROMPT_TARGET, 'r', encoding='utf-8') as file:
@@ -29,13 +29,18 @@ project_client = AIProjectClient(
     credential=DefaultAzureCredential(),
 )
 
+# Create function tools for cora agent
+functions = create_function_tool_for_agent("cora")
+toolset = ToolSet()
+toolset.add(functions)
+project_client.agents.enable_auto_function_calls(tools=functions)
 
 with project_client:
     agent = project_client.agents.create_agent(
         model=os.environ["AZURE_AI_AGENT_MODEL_DEPLOYMENT_NAME"],  # Model deployment name
-        name="Cora",  # Name of the agent
+        name="Cora - Contoso Shopping Assistant",  # Name of the agent
         instructions=CORA_PROMPT,  # Instructions for the agent
-        # toolset=toolset
+        toolset=toolset
     )
-    print(f"Created agent, ID: {agent.id}")
+    print(f"Created Cora agent, ID: {agent.id}")
 

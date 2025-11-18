@@ -345,4 +345,12 @@ def create_function_tool_for_agent(agent_type: str) -> FunctionTool:
     elif agent_type == "inventory_agent":
         inventory_functions: Set[Callable[..., Any]] = {mcp_inventory_check}
         functions = FunctionTool(inventory_functions)
+    elif agent_type == "cart_manager":
+        # Cart manager uses conversation context, minimal tools needed
+        cart_functions: Set[Callable[..., Any]] = set()
+        functions = FunctionTool(cart_functions)
+    elif agent_type == "cora":
+        # Cora is a general assistant with product recommendations
+        cora_functions: Set[Callable[..., Any]] = {mcp_product_recommendations}
+        functions = FunctionTool(cora_functions)
     return functions
