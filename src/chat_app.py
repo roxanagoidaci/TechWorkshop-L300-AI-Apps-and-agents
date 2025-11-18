@@ -432,43 +432,111 @@ async def health_check():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    """
+    Main WebSocket endpoint implementing a Multi-Agent System with Intelligent Handoff.
+    
+    This endpoint orchestrates multiple specialized AI agents that handle different aspects
+    of the shopping experience:
+    
+    MULTI-AGENT ARCHITECTURE:
+    ========================
+    1. Cora (General Shopping Assistant) - Product browsing, general questions
+    2. Interior Designer - Design recommendations, color schemes, image creation
+    3. Cart Manager - Shopping cart operations (add/remove items, checkout)
+    4. Inventory Agent - Stock availability and inventory checks
+    5. Customer Loyalty - Discount calculations and loyalty programs
+    
+    INTELLIGENT HANDOFF SYSTEM:
+    ==========================
+    The HandoffService uses LLM-based intent classification to intelligently route
+    user queries to the most appropriate specialized agent:
+    
+    - Analyzes user message content and conversation context
+    - Classifies intent into one of the agent domains
+    - Provides confidence scores and reasoning for routing decisions
+    - Maintains session-aware domain tracking to reduce unnecessary handoffs
+    - Supports lazy classification to optimize performance
+    
+    UNIFIED AGENT EXECUTION PATTERN:
+    ===============================
+    All agents are executed through a consistent AgentProcessor pattern:
+    
+    1. Intent Classification: HandoffService determines the target agent
+    2. Context Preparation: Enriches user message with relevant data (images, products, history)
+    3. Agent Execution: AgentProcessor handles the conversation with streaming responses
+    4. Response Processing: Parses agent output, updates session state, sends to user
+    
+    SESSION STATE MANAGEMENT:
+    ========================
+    - persistent_cart: Shopping cart maintained across the session
+    - session_discount_percentage: Customer loyalty discount (calculated once)
+    - persistent_image_url: Last uploaded image for context
+    - chat_history: Recent conversation for context (5 messages)
+    - raw_io_history: Full input/output history for cart management
+    
+    MULTIMODAL SUPPORT:
+    ==================
+    - Image upload and analysis (room photos, product images)
+    - Video upload and summarization
+    - Product recommendations based on visual content
+    
+    OBSERVABILITY:
+    =============
+    - OpenTelemetry distributed tracing for all agent calls
+    - Performance timing logs for each operation
+    - Structured logging for debugging and monitoring
+    """
     session_start_time = time.time()
     session_id = str(uuid.uuid4())
     logger.info("WebSocket Session Started")
     
     await websocket.accept()
-    thread = project_client.agents.threads.create()
+    
+    # Create dedicated threads for agent conversations
+    thread = project_client.agents.threads.create()  # Main conversation thread
+    customer_loyalty_thread = project_client.agents.threads.create()  # Separate thread for loyalty calculations
+    
+    # Conversation history management (limited to 5 recent messages for context)
     chat_history: Deque[Tuple[str, str]] = deque(maxlen=5)
     customer_loyalty_thread = project_client.agents.threads.create()
 
-    # Flag to track if customer loyalty task has been executed
-    customer_loyalty_executed = False
-
-    # Session-level variable to track discount_percentage
-    session_discount_percentage = ""
-    # Store the full loyalty response for later
-    session_loyalty_response = None
+    # =============================================================================
+    # SESSION STATE VARIABLES
+    # =============================================================================
     
-    # Flag to track if loyalty response has been sent to user
-    loyalty_response_sent = False
-
+    # Customer Loyalty Agent State
+    # ---------------------------
+    customer_loyalty_executed = False  # Ensures loyalty calculation runs only once per session
+    session_discount_percentage = ""   # Stores customer's discount rate for the session
+    session_loyalty_response = None    # Full loyalty agent response (sent after cart operations)
+    loyalty_response_sent = False      # Prevents duplicate loyalty responses
     
-    # Session-level variable to track persistent image URL
-    persistent_image_url = ""
-
-    # Session-level variable to track persistent cart state
-    persistent_cart = []
-
-    # Dictionary to cache image URLs and their descriptions
-    image_cache = {}
-
-    # Track bad prompts (those that triggered content filter)
-    bad_prompts = set()
-
-    # Use deque with maxlen for raw_io_history to prevent unbounded growth
-    raw_io_history = deque(maxlen=100)
+    # Multimodal Content State
+    # -----------------------
+    persistent_image_url = ""  # Last uploaded image URL for context in multi-turn conversations
+    image_cache = {}           # Cache image descriptions to avoid redundant AI vision calls
+    
+    # Shopping Cart State
+    # ------------------
+    persistent_cart = []  # Shopping cart maintained across all agent interactions
+    raw_io_history = deque(maxlen=100)  # Complete I/O history for cart state management
+    
+    # Conversation Management
+    # ----------------------
+    bad_prompts = set()  # Track prompts that triggered content filters for history redaction
 
     async def run_customer_loyalty_task(customer_id):
+        """
+        Background task: Calculate customer discount using Customer Loyalty Agent.
+        
+        This runs asynchronously at session start to:
+        1. Determine customer's loyalty tier and discount percentage
+        2. Store discount for application to cart operations
+        3. Prepare loyalty message for display after cart interactions
+        
+        The loyalty response is intentionally NOT sent immediately - it's stored
+        and sent after the first cart operation to avoid overwhelming the user.
+        """
         start_time = time.time()
         with tracer.start_as_current_span("Run Customer Loyalty Thread"):
             nonlocal session_discount_percentage, session_loyalty_response
@@ -602,21 +670,42 @@ async def websocket_endpoint(websocket: WebSocket):
             #     logger.error("Error during mcp-tools-agent response generation", exc_info=True)
             #     await websocket.send_text(fast_json_dumps({"answer": "Error during mcp-tools-agent response generation", "error": str(e), "cart": persistent_cart}))
 
-            # # Step 3: Multi-agent with handoff using HandoffService
+            # =============================================================================
+            # INTELLIGENT HANDOFF: Intent Classification & Agent Selection
+            # =============================================================================
+            # The HandoffService analyzes the user's message and conversation context to
+            # determine which specialized agent should handle the request. This replaces
+            # keyword-based routing with LLM-powered intent understanding.
+            #
+            # Process:
+            # 1. Format conversation history (redact filtered content)
+            # 2. Call HandoffService.classify_intent() with message + context
+            # 3. Receive structured classification with domain, confidence, reasoning
+            # 4. Route to appropriate agent based on classification
+            #
+            # Supported Domains:
+            # - cora: General shopping assistance
+            # - interior_designer: Design recommendations and image creation
+            # - cart_manager: Shopping cart operations
+            # - inventory_agent: Stock availability checks
+            # - customer_loyalty: Discount and promotion queries
+            # =============================================================================
             try:
                 handoff_start_time = time.time()
                 formatted_history = format_chat_history(redact_bad_prompts_in_history(chat_history, bad_prompts))
                 logger.debug("Handoff agent execution initiated - commencing agent selection protocol")
+                
                 with tracer.start_as_current_span("Handoff Intent Classification"):
-                    # Use new HandoffService for intent classification
+                    # Intent classification using structured outputs for reliable routing
                     intent_result = handoff_service.classify_intent(
                         user_message=user_message,
                         session_id=session_id,
                         chat_history=formatted_history
                     )
                 
-                agent_name = intent_result["agent_id"]
-                agent_selected = validated_env_vars.get(agent_name)
+                # Extract agent information from classification result
+                agent_name = intent_result["agent_id"]  # e.g., "cora", "cart_manager"
+                agent_selected = validated_env_vars.get(agent_name)  # Get agent ID from environment
                 
                 logger.debug(f"Intent classification: domain={intent_result['domain']}, "
                            f"confidence={intent_result['confidence']:.2f}, "
@@ -642,28 +731,46 @@ async def websocket_endpoint(websocket: WebSocket):
                 }))
                 continue
             
-            # Intent classification handles cart routing now - no special case needed
-            # The HandoffService will classify cart-related queries and route to cart_manager agent
-            # Unified agent execution with enriched context
+            # =============================================================================
+            # UNIFIED AGENT EXECUTION: Context Enrichment & Agent Processing
+            # =============================================================================
+            # All agents now follow a consistent execution pattern:
+            # 1. Context Enrichment: Add multimodal data (images, videos, products)
+            # 2. Agent-Specific Preparation: Format context based on agent needs
+            # 3. Agent Execution: Use AgentProcessor for streaming responses
+            # 4. Response Handling: Parse output, update state, send to user
+            #
+            # No more if-else branching - all agents use the same processor pattern!
+            # =============================================================================
             try:
                 agent_execution_start_time = time.time()
                 logger.debug(f"{agent_name} agent execution initiated")
                 
-                # Prepare enriched context for agent
-                enriched_message = user_message
-                image_data = None
-                video_summary = None
-                products = None
+                # Initialize context enrichment variables
+                enriched_message = user_message  # Base message
+                image_data = None                # Image description from vision analysis
+                video_summary = None             # Video summary from analysis
+                products = None                  # Product recommendations from AI Search
+                
+                # =============================================================================
+                # MULTIMODAL CONTENT PROCESSING: Enrich context with visual data
+                # =============================================================================
+                # Process images and videos to add visual understanding to the agent's context.
+                # This enables contextually aware recommendations based on what the user shares.
+                # =============================================================================
                 
                 # Process multimodal inputs if present
                 if image_url or video_url:
                     if image_url:
+                        # IMAGE ANALYSIS: Extract visual information from uploaded images
+                        # Uses phi-4 vision model with caching to avoid re-analyzing same image
+                        # Results are cached for the session and shared across agents
                         image_start_time = time.time()
                         log_cache_status(image_cache, image_url)
                         image_data = await get_cached_image_description(image_url, image_cache)
                         log_timing("Image Analysis", image_start_time, f"URL: {image_url[:50]}...")
                         
-                        # Send analysis message to user
+                        # Send analysis message to user (provides feedback during processing)
                         analysis_msg = get_rotating_message(IMAGE_ANALYSIS_MESSAGES)
                         await websocket.send_text(fast_json_dumps({
                             "answer": analysis_msg,
@@ -673,11 +780,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         logger.debug("Image analysis completed")
                     
                     if video_url:
+                        # VIDEO ANALYSIS: Summarize video content using vision model
+                        # Extracts key frames and provides comprehensive summary
+                        # Useful for room tours, product demonstrations, etc.
                         video_start_time = time.time()
                         logger.debug("Video analysis initiated")
                         video_summary = await get_video_summary(video_url)
                         
-                        # Send upload confirmation
+                        # Send upload confirmation (acknowledges receipt)
                         thank_you_msg = get_rotating_message(VIDEO_UPLOAD_MESSAGES)
                         await websocket.send_text(fast_json_dumps({
                             "answer": thank_you_msg,
@@ -687,7 +797,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         
                         log_timing("Video Analysis", video_start_time, f"URL: {video_url[:50]}...")
                         
-                        # Send analysis message
+                        # Send analysis message (indicates processing in progress)
                         analysis_msg = get_rotating_message(VIDEO_ANALYSIS_MESSAGES)
                         await websocket.send_text(fast_json_dumps({
                             "answer": analysis_msg,
@@ -696,18 +806,37 @@ async def websocket_endpoint(websocket: WebSocket):
                         }))
                         logger.debug("Video analysis completed")
                 
+                # =============================================================================
+                # PRODUCT RECOMMENDATIONS: AI Search integration for contextual products
+                # =============================================================================
+                # For agents that make product recommendations, query AI Search with enriched
+                # context (user message + visual analysis). This provides the agent with
+                # relevant product options to suggest based on user needs and visual context.
+                # =============================================================================
+                
                 # Get product recommendations for relevant agents
                 if agent_name in ["interior_designer", "interior_designer_create_image", "cora"]:
                     product_start_time = time.time()
+                    # Build search query from all available context
                     search_query = user_message
                     if image_data:
+                        # Add visual context to search (e.g., "blue living room" → search for blue paint)
                         search_query += f" {image_data} paint accessories, paint sprayers, drop cloths, painters tape"
                     if video_summary:
+                        # Add video context to search (e.g., room tour → search for room-specific products)
                         search_query += f" {video_summary} paint accessories, paint sprayers, drop cloths, painters tape"
                     
                     products = product_recommendations(search_query)
                     log_timing("Product Recommendations", product_start_time, f"Found: {len(products) if products else 0}")
                     logger.debug("Product recommendations completed")
+                
+                # =============================================================================
+                # CONTEXT ENRICHMENT: Build complete message with all available context
+                # =============================================================================
+                # Combine user message with multimodal analysis and product data to create
+                # a comprehensive context for the agent. This enables more accurate and
+                # contextually relevant responses.
+                # =============================================================================
                 
                 # Build enriched message with all context
                 if image_data or video_summary or products:
@@ -719,13 +848,30 @@ async def websocket_endpoint(websocket: WebSocket):
                     if products:
                         context_parts.append(f"Available products: {fast_json_dumps(products)}")
                     
+                    # Prepend user message, append all enriched context
                     enriched_message = f"{user_message}\n\n" + "\n".join(context_parts)
+                
+                # =============================================================================
+                # AGENT EXECUTION: Unified pattern for all agents (no if-else branching!)
+                # =============================================================================
+                # All agents now follow the same execution flow:
+                # 1. Prepare agent-specific context (raw_io_history, conversation, enriched message)
+                # 2. Get or create AgentProcessor for the selected agent
+                # 3. Stream response chunks from the agent
+                # 4. Parse structured response and update session state
+                #
+                # SPECIAL CASE: interior_designer_create_image uses DALL-E instead of agent
+                # =============================================================================
                 
                 # Execute agent based on type - unified agent processor pattern
                 bot_reply = ""
                 
                 with tracer.start_as_current_span(f"{agent_name.title()} Agent Call"):
-                    # Handle special case: image creation flow
+                    # =================================================================
+                    # SPECIAL CASE: Image Creation (uses DALL-E, not agent processor)
+                    # =================================================================
+                    # This is the only case that doesn't use the unified agent pattern
+                    # because it generates images via DALL-E API rather than conversing
                     if agent_name == "interior_designer_create_image":
                         # Acknowledge image creation request
                         thank_you_msg = get_rotating_message(IMAGE_CREATE_MESSAGES)
@@ -735,15 +881,15 @@ async def websocket_endpoint(websocket: WebSocket):
                             "cart": persistent_cart
                         }))
                         
-                        # Use persistent image URL for context
+                        # Use persistent image URL for context (e.g., "make this room blue")
                         if persistent_image_url:
                             image_data = await get_cached_image_description(persistent_image_url, image_cache)
                             enriched_message = f"{user_message} {image_data}"
                         
-                        # Create image
+                        # Create image using DALL-E
                         image = create_image(text=enriched_message, image_url=persistent_image_url)
                         
-                        # Build response with image
+                        # Build response with generated image URL
                         response_data = {
                             "answer": "Here is the requested image",
                             "products": "",
@@ -766,35 +912,74 @@ async def websocket_endpoint(websocket: WebSocket):
                         log_timing("Agent Execution", agent_execution_start_time, f"Agent: {agent_name}")
                         continue  # Skip common response handling
                     
+                    # =================================================================
+                    # AGENT-SPECIFIC CONTEXT PREPARATION
+                    # =================================================================
+                    # Each agent type receives context tailored to its needs:
+                    # - cart_manager: Full raw I/O history for tracking cart state changes
+                    # - cora: Formatted conversation history for contextual responses
+                    # - Others: Enriched message with multimodal + product data
+                    # =================================================================
+                    
                     # Prepare context based on agent type
-                    agent_context = enriched_message
+                    agent_context = enriched_message  # Default: enriched message
                     
                     # Cart manager needs full raw_io_history for state management
                     if agent_name == "cart_manager":
+                        # Provide complete interaction history so cart_manager can track
+                        # all add/remove operations and maintain accurate cart state
                         agent_context = f"{enriched_message}\n\nRAW_IO_HISTORY:\n{fast_json_dumps(list(raw_io_history), option=orjson.OPT_INDENT_2)}"
                     
-                    # Cora needs conversation history
+                    # Cora needs conversation history for contextual dialogue
                     elif agent_name == "cora":
+                        # Provide formatted chat history so cora can reference previous
+                        # conversation turns and maintain coherent multi-turn dialogue
                         agent_context = f"{formatted_history}\n\nUser: {enriched_message}"
+                    
+                    # =================================================================
+                    # UNIFIED AGENT PROCESSOR EXECUTION (All agents use this pattern!)
+                    # =================================================================
+                    # Get or create an AgentProcessor instance for the selected agent.
+                    # The processor manages the agent's execution lifecycle and streams
+                    # responses back token-by-token for a better user experience.
+                    #
+                    # This replaces the old if-else branching with a single unified flow.
+                    # =================================================================
                     
                     # All agents use unified agent processor pattern
                     processor = get_or_create_agent_processor(
-                        agent_id=agent_selected,
-                        agent_type=agent_name,
-                        thread_id=thread.id,
-                        project_client=project_client
+                        agent_id=agent_selected,     # Agent ID from environment variables
+                        agent_type=agent_name,       # Agent type (cora, cart_manager, etc.)
+                        thread_id=thread.id,         # Conversation thread for stateful agents
+                        project_client=project_client  # Azure AI client for agent execution
                     )
                     
+                    # Stream response from agent (yields chunks as they're generated)
                     async for msg in processor.run_conversation_with_text_stream(input_message=agent_context):
-                        bot_reply = extract_bot_reply(msg)
+                        bot_reply = extract_bot_reply(msg)  # Extract text from streaming message
                 
                 logger.debug(f"{agent_name} agent execution completed")
                 
                 log_timing("Agent Execution", agent_execution_start_time, f"Agent: {agent_name}")
                 
-                # Parse the response first to get products
+                # =============================================================================
+                # RESPONSE PROCESSING: Parse structured output and update session state
+                # =============================================================================
+                # Agents return structured JSON responses with fields like answer, products,
+                # discount_percentage, image_url, etc. We parse this, update session state,
+                # and send formatted response to the user.
+                # =============================================================================
+                
+                # Parse the response first to get structured fields (answer, products, etc.)
                 parsed_response = parse_agent_response(bot_reply)
-                parsed_response["agent"] = agent_name  # Override agent field
+                parsed_response["agent"] = agent_name  # Override agent field to show which agent responded
+                
+                # =============================================================================
+                # CART STATE UPDATE: Persist cart changes from cart_manager agent
+                # =============================================================================
+                # The cart_manager agent returns an updated cart array in its response.
+                # We persist this to the session so all subsequent messages see the updated cart.
+                # =============================================================================
                 
                 # Update persistent_cart if cart_manager returned a cart
                 if agent_name == "cart_manager" and "cart" in parsed_response:
@@ -802,15 +987,29 @@ async def websocket_endpoint(websocket: WebSocket):
                         persistent_cart = parsed_response["cart"]
                         logger.debug(f"Cart updated by cart_manager: {len(persistent_cart)} items")
                 
+                # =============================================================================
+                # CONVERSATION HISTORY UPDATE: Maintain chat context for multi-turn dialogue
+                # =============================================================================
+                # Add the bot's response to chat history so future messages have context.
+                # Clean the history to remove large product data (keep only product names).
+                # =============================================================================
+                
                 # Add the bot reply to chat history with products if available
                 bot_answer = parsed_response.get("answer", bot_reply or "")
                 product_names = extract_product_names_from_response(parsed_response)
                 chat_history.append(("bot", bot_answer + product_names))
                 print(f"Chat history after bot reply: {chat_history}")
                 
-                # Clean the conversation history to remove large product data
+                # Clean the conversation history to remove large product data (keep compact)
                 chat_history = clean_conversation_history(chat_history)
                 print(f"Chat history after bot reply: {chat_history}")
+                
+                # =============================================================================
+                # DISCOUNT PERSISTENCE: Maintain customer loyalty tier across session
+                # =============================================================================
+                # Once the customer_loyalty agent calculates a discount, persist it across
+                # all subsequent responses so the user sees consistent discount information.
+                # =============================================================================
                 
                 # Update session discount_percentage if a new one is received
                 if parsed_response.get("discount_percentage"):
@@ -820,10 +1019,25 @@ async def websocket_endpoint(websocket: WebSocket):
                 if session_discount_percentage and not parsed_response.get("discount_percentage"):
                     parsed_response["discount_percentage"] = session_discount_percentage
                 
+                # =============================================================================
+                # RESPONSE TRANSMISSION: Send structured response to user
+                # =============================================================================
+                # Send the final response with all fields (answer, products, cart, discount, etc.)
+                # Also append to raw_io_history for cart_manager's state tracking.
+                # =============================================================================
+                
                 # When sending any other response, also append to raw_io_history
                 response_json = fast_json_dumps({**parsed_response, "cart": persistent_cart})
                 raw_io_history.append({"output": response_json, "cart": persistent_cart})
                 await websocket.send_text(response_json)
+                
+                # =============================================================================
+                # DELAYED LOYALTY RESPONSE: Send loyalty message after cart operations
+                # =============================================================================
+                # The customer_loyalty agent runs in background at session start.
+                # Its response is delayed until after the first cart_manager operation,
+                # ensuring users see their loyalty tier after interacting with the cart.
+                # =============================================================================
                 
                 # After cart_manager response, send loyalty response if available (only once per session)
                 if agent_name == "cart_manager" and session_loyalty_response and not loyalty_response_sent:
@@ -831,20 +1045,48 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_text(fast_json_dumps(loyalty_response_with_cart))
                     loyalty_response_sent = True
                     
+            # =============================================================================
+            # ERROR HANDLING: Failure during agent execution
+            # =============================================================================
+            # If agent execution fails, catch the exception, log it for debugging,
+            # and send a user-friendly error message with the current cart state.
+            # =============================================================================
             except Exception as e:
                 logger.error("Error in agent execution", exc_info=True)
                 try:
-                    await websocket.send_text(fast_json_dumps({"answer": "Internal server error", "error": str(e), "cart": persistent_cart}))
+                    await websocket.send_text(fast_json_dumps({
+                        "answer": "Internal server error",
+                        "error": str(e),
+                        "cart": persistent_cart
+                    }))
                 except Exception:
-                    pass
+                    pass  # If even error sending fails, silently continue
+    
+    # =============================================================================
+    # SESSION-LEVEL ERROR HANDLING: Catch WebSocket disconnects and errors
+    # =============================================================================
+    # Handle normal disconnections (user closes tab) and unexpected session errors.
+    # Log all errors for monitoring and debugging.
+    # =============================================================================
     except WebSocketDisconnect:
-        pass
+        pass  # Normal disconnection, no action needed
     except Exception as e:
         logger.error("WebSocket session error", exc_info=True)
         try:
-            await websocket.send_text(fast_json_dumps({"answer": "Internal server error", "error": str(e), "cart": persistent_cart}))
+            await websocket.send_text(fast_json_dumps({
+                "answer": "Internal server error",
+                "error": str(e),
+                "cart": persistent_cart
+            }))
         except Exception:
-            pass
+            pass  # If sending error fails, give up gracefully
+    
+    # =============================================================================
+    # SESSION CLEANUP: Log session duration and cleanup resources
+    # =============================================================================
+    # When the WebSocket connection closes (user disconnects, network error, etc.),
+    # log the total session duration for monitoring and performance analysis.
+    # =============================================================================
     finally:
         session_duration = time.time() - session_start_time
         logger.info(f"WebSocket Session Ended - Duration: {session_duration:.3f}s")
