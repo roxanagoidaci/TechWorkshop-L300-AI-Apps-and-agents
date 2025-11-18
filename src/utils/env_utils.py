@@ -10,6 +10,7 @@ def load_env_vars() -> Dict[str, Optional[str]]:
         'customer_loyalty': os.getenv("customer_loyalty"),
         'inventory_agent': os.getenv("inventory_agent"),
         'cora': os.getenv("cora"),
+        'cart_manager': os.getenv("cart_manager"),
         'phi_4_endpoint': os.getenv("phi_4_endpoint"),
         'phi_4_deployment': os.getenv("phi_4_deployment"),
         'phi_4_api_version': os.getenv("phi_4_api_version"),
