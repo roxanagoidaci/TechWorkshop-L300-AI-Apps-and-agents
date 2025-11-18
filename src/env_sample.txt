@@ -14,12 +14,13 @@ interior_designer=""
 customer_loyalty=""
 inventory_agent=""
 cora=""
+cart_manager=""
 
 # GPT-4.1 credentials
 gpt_endpoint=""
 gpt_deployment="gpt-4.1"
 gpt_api_key=""
-gpt_api_version="2024-12-01-preview"
+gpt_api_version="2025-01-01-preview"
 
 # Phi-4 credentials
 phi_4_endpoint=""
@@ -47,5 +48,5 @@ CONTAINER_NAME="product_catalog"
 # Application Insights credentials
 APPLICATIONINSIGHTS_CONNECTION_STRING=""
 
-#should be the app service url
+# MCP Server URL (should be the app service URL)
 MCP_SERVER_URL="http://<APP_SERVICE_URL>/mcp-inventory/sse"
