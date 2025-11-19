@@ -63,7 +63,7 @@ AGENT_DOMAINS = {
 }
 
 # Intent classification prompt
-INTENT_CLASSIFIER_PROMPT = """You are an intent classifier for Contoso customer support.
+INTENT_CLASSIFIER_PROMPT = """You are an intent classifier for Zava shopping assistant.
 
 Available domains:
 1. cora: General shopping, product browsing, general questions
